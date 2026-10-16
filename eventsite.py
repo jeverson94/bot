@@ -88,7 +88,7 @@ def _check_auth():
 
 
 _PUBLIC_PATHS = {"/api/health", "/auth/discord/login", "/auth/discord/callback", "/auth/logout", "/legacy/enter", "/webhooks/stripe", "/api/public/builds"}
-_SESSION_ONLY_PATHS = {"/api/me", "/api/slots/personal", "/api/slots/guild"}  # exige login, mas nao e sobre uma guilda especifica
+_SESSION_ONLY_PATHS = {"/api/me", "/api/slots/personal", "/api/slots/guild", "/api/guilda-albion"}  # exige login, mas nao e sobre uma guilda especifica (ou valida a guilda na propria rota)
 
 
 @app.before_request
@@ -144,7 +144,10 @@ def _cors(response):
     # API publica de leitura (sem dado sensivel) consumida pelo site novo
     # (dominio diferente, hospedado fora daqui) - libera geral.
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    # POST/DELETE tambem: o dashboard novo grava por fetch (vinculo da guilda,
+    # saldo). A autenticacao e o Bearer token, nao cookie, entao liberar a
+    # origem nao abre nada pra outro site.
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
@@ -2584,6 +2587,74 @@ def api_me():
         "admin_guilds": admin_guilds,
         "locked_guilds": _locked_guilds(s),
     })
+
+
+# --- guilda do Albion vinculada a cada servidor do Discord -----------------
+# O mesmo vinculo que o comando /guilda vincular grava no bot. Quem ve: todo
+# servidor que a pessoa administra (com ou sem slot) e os que ela usa pelo
+# painel. Quem altera: so admin do servidor (Administrador ou Gerenciar
+# Servidor no Discord, conforme o login).
+
+def _servers_for_session(session):
+    eligible = {g["id"]: g for g in session.get("eligible_guilds", [])}
+    servers = {}
+    for w in _usable_workspaces(session):
+        if w.get("personal"):
+            continue
+        servers[w["id"]] = {"guild_id": w["id"], "name": w.get("name"), "icon": w.get("icon"), "locked": False, "admin": w["id"] in eligible}
+    for gid, g in eligible.items():
+        if gid not in servers:
+            servers[gid] = {"guild_id": gid, "name": g.get("name"), "icon": g.get("icon"), "locked": True, "admin": True}
+    return list(servers.values())
+
+
+@app.route("/api/guilda-albion", methods=["GET"])
+def api_guilda_albion_list():
+    session = require_session()
+    out = []
+    for srv in _servers_for_session(session):
+        link = shared.load_albion_guild(srv["guild_id"])
+        out.append({**srv, "albion": link, "url": shared.albion_guild_site_url(link) if link else None})
+    return jsonify({"ok": True, "servers": out})
+
+
+@app.route("/api/guilda-albion", methods=["POST"])
+def api_guilda_albion_set():
+    session = require_session()
+    body = request.get_json(silent=True) or {}
+    guild_id = str(body.get("guild_id") or "")
+    region = str(body.get("s") or "am")
+    albion_id = str(body.get("id") or "").strip()
+    eligible_ids = {g["id"] for g in session.get("eligible_guilds", [])}
+    if guild_id not in eligible_ids:
+        abort(403)
+    if region not in shared.ALBION_REGIONS or not shared.looks_like_albion_guild_id(albion_id):
+        abort(400)
+    info = shared.fetch_albion_guild_info(region, albion_id)
+    if info is None and not body.get("n"):
+        return jsonify({"ok": False, "erro": "A API do Albion nao respondeu. Tente de novo em alguns minutos."}), 502
+    link = {
+        "s": region,
+        "id": albion_id,
+        "n": (info or {}).get("Name") or str(body.get("n"))[:60],
+        "a": (info or {}).get("AllianceTag") or (info or {}).get("AllianceName") or str(body.get("a") or "")[:30],
+        "por": str(session["discord_id"]),
+        "por_nome": session.get("global_name") or session.get("username"),
+        "em": int(time.time()),
+        "origem": "site",
+    }
+    shared.save_albion_guild(link, guild_id)
+    return jsonify({"ok": True, "albion": link, "url": shared.albion_guild_site_url(link)})
+
+
+@app.route("/api/guilda-albion", methods=["DELETE"])
+def api_guilda_albion_clear():
+    session = require_session()
+    guild_id = str(request.args.get("guild_id") or "")
+    if guild_id not in {g["id"] for g in session.get("eligible_guilds", [])}:
+        abort(403)
+    shared.clear_albion_guild(guild_id)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/slots/personal", methods=["POST"])

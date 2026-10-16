@@ -1002,3 +1002,81 @@ def quitar_saldo(guild_id, discord_id, por_discord_id, por_nome=None, valor=None
 def _now_iso():
     import datetime
     return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+# =========================
+# GUILDA DO ALBION LIGADA AO SERVIDOR
+# =========================
+# Cada servidor do Discord pode ter UMA guilda do jogo vinculada
+# (guild_data/<guild_id>/albion_guild.json). Quem vincula: admin do servidor,
+# pelo comando /guilda vincular no Discord ou pelo painel do site - os dois
+# gravam o mesmo arquivo. O id da guilda do jogo nunca e digitado a mao: a
+# pessoa busca pelo nome e o id vem da busca.
+
+ALBION_REGIONS = {
+    "am": ("Américas", "https://gameinfo.albiononline.com/api/gameinfo"),
+    "eu": ("Europa", "https://gameinfo-ams.albiononline.com/api/gameinfo"),
+    "as": ("Ásia", "https://gameinfo-sgp.albiononline.com/api/gameinfo"),
+}
+# Site novo (Hostinger): tem um banco com as guildas que aparecem nas batalhas,
+# entao a busca por nome responde na hora (a API oficial leva de 5 a 40 s).
+SITE_URL = "https://seagreen-rat-589164.hostingersite.com"
+_ALBION_GUILD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{22}$")
+
+
+def looks_like_albion_guild_id(texto):
+    return bool(_ALBION_GUILD_ID_RE.match(str(texto or "").strip()))
+
+
+def load_albion_guild(guild_id=None):
+    """Vinculo atual ({s, id, n, a, por, em}) ou None."""
+    data = _load_json(_guild_file(guild_id, "albion_guild.json"), None)
+    return data if isinstance(data, dict) and data.get("id") else None
+
+
+def save_albion_guild(data, guild_id=None):
+    _save_json(_guild_file(guild_id, "albion_guild.json"), data)
+
+
+def clear_albion_guild(guild_id=None):
+    f = _guild_file(guild_id, "albion_guild.json")
+    if f.exists():
+        f.unlink()
+
+
+def search_albion_guilds_fast(region, texto, timeout=2.5):
+    """Busca pelo nome no banco do site: [{id, n, a}]. Rapida o bastante pro
+    autocomplete do Discord (que so espera 3 s). Lista vazia se falhar."""
+    try:
+        resp = requests.get(f"{SITE_URL}/api/albion.php", params={"r": "buscaguilda", "s": region, "q": texto}, timeout=timeout)
+        data = resp.json() if resp.ok else []
+        return [{"id": g["id"], "n": g["n"], "a": g.get("a") or ""} for g in data if g.get("id")]
+    except Exception:
+        return []
+
+
+def search_albion_guilds_api(region, texto, timeout=40):
+    """Busca na API oficial (lenta, mas acha qualquer guilda): [{id, n, a}]."""
+    host = ALBION_REGIONS.get(region, ALBION_REGIONS["am"])[1]
+    try:
+        resp = requests.get(f"{host}/search", params={"q": texto}, timeout=timeout)
+        data = (resp.json() or {}).get("guilds") or [] if resp.ok else []
+        return [{"id": g["Id"], "n": g["Name"], "a": g.get("AllianceName") or ""} for g in data if g.get("Id")]
+    except Exception:
+        return []
+
+
+def fetch_albion_guild_info(region, albion_guild_id, timeout=40):
+    """Dados oficiais da guilda (Name, AllianceName, AllianceTag, MemberCount,
+    FounderName, Founded, killFame, DeathFame) ou None se a API nao responder."""
+    host = ALBION_REGIONS.get(region, ALBION_REGIONS["am"])[1]
+    try:
+        resp = requests.get(f"{host}/guilds/{albion_guild_id}", timeout=timeout)
+        return resp.json() if resp.ok else None
+    except Exception:
+        return None
+
+
+def albion_guild_site_url(link):
+    """Pagina da guilda no site (perfil com batalhas, membros e rivais)."""
+    return f"{SITE_URL}/guildas/ver/?s={link['s']}&id={link['id']}"

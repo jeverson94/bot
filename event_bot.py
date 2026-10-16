@@ -73,6 +73,9 @@ from albion_shared import (
     set_current_guild, list_tenant_guild_ids, get_current_guild,
     load_saldos, save_saldos, load_saldo_gestores, save_saldo_gestores,
     owner_discord_id_for_guild, is_saldo_gestor, add_saldo, quitar_saldo,
+    ALBION_REGIONS, SITE_URL, looks_like_albion_guild_id, load_albion_guild, save_albion_guild,
+    clear_albion_guild, search_albion_guilds_fast, search_albion_guilds_api, fetch_albion_guild_info,
+    albion_guild_site_url,
 )
 
 # =========================
@@ -3660,7 +3663,119 @@ async def sync_cmd(interaction: discord.Interaction):
     await interaction.followup.send(f"✅ {len(synced)} comandos sincronizados neste servidor.", ephemeral=True)
 
 
+# --- guilda do Albion vinculada ao servidor ----------------------------------
+# Mesmo arquivo que o painel do site grava (guild_data/<id>/albion_guild.json).
+# A busca pelo nome usa o banco do site (responde na hora, dentro dos 3 s do
+# autocomplete); se a guilda ainda nao estiver la, a opcao "Procurar na API"
+# faz a busca completa depois do comando enviado.
+
+guilda_group = app_commands.Group(name="guilda", description="Guilda do Albion ligada a este servidor")
+REGIAO_CHOICES = [app_commands.Choice(name=v[0], value=k) for k, v in ALBION_REGIONS.items()]
+
+
+async def guildas_albion_autocomplete(interaction: discord.Interaction, current: str):
+    regiao = getattr(interaction.namespace, "servidor", None) or "am"
+    texto = (current or "").strip()
+    if len(texto) < 2:
+        return []
+    achadas = await asyncio.to_thread(search_albion_guilds_fast, regiao, texto)
+    opcoes = [app_commands.Choice(name=(g["n"] + (f" [{g['a']}]" if g["a"] else ""))[:100], value=g["id"]) for g in achadas[:24]]
+    opcoes.append(app_commands.Choice(name=f"Procurar \"{texto}\" na API do Albion (mais lento)"[:100], value=("q:" + texto)[:100]))
+    return opcoes
+
+
+def _avisar_site_acompanhar(link):
+    # Pede pro site comecar a guardar as kills e os membros dessa guilda (painel de status).
+    try:
+        requests.get(f"{SITE_URL}/api/albion.php", params={"r": "acompanhar", "s": link["s"], "id": link["id"]}, timeout=10)
+    except Exception:
+        pass
+
+
+def _embed_guilda(link, info):
+    regiao = ALBION_REGIONS.get(link["s"], ("?",))[0]
+    embed = discord.Embed(title=link["n"], url=albion_guild_site_url(link), color=GOLD)
+    embed.add_field(name="Servidor", value=regiao)
+    if link.get("a"):
+        embed.add_field(name="Alianca", value=link["a"])
+    if info:
+        embed.add_field(name="Membros", value=str(info.get("MemberCount") or "?"))
+        embed.add_field(name="Fama de abate", value=f"{int(info.get('killFame') or 0):,}".replace(",", "."))
+        embed.add_field(name="Fama de morte", value=f"{int(info.get('DeathFame') or 0):,}".replace(",", "."))
+        if info.get("FounderName"):
+            embed.add_field(name="Fundador", value=info["FounderName"])
+    embed.set_footer(text="Painel completo com kills, lutas e membros no site (clique no titulo).")
+    return embed
+
+
+@guilda_group.command(name="vincular", description="[admin] Liga a guilda do Albion a este servidor (busca pelo nome)")
+@app_commands.describe(servidor="Servidor do Albion onde a guilda joga", guilda="Comece a digitar o nome da guilda e escolha na lista")
+@app_commands.choices(servidor=REGIAO_CHOICES)
+@app_commands.autocomplete(guilda=guildas_albion_autocomplete)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def guilda_vincular(interaction: discord.Interaction, servidor: app_commands.Choice[str], guilda: str):
+    set_current_guild(interaction.guild_id)
+    await interaction.response.defer(ephemeral=True)
+    regiao = servidor.value
+    escolha = (guilda or "").strip()
+    albion_id = None
+    if looks_like_albion_guild_id(escolha):
+        albion_id = escolha
+    else:
+        # Texto livre (ou a opcao "Procurar na API"): busca completa e pega o nome exato, se houver.
+        texto = escolha[2:] if escolha.startswith("q:") else escolha
+        achadas = await asyncio.to_thread(search_albion_guilds_api, regiao, texto)
+        exata = next((g for g in achadas if g["n"].lower() == texto.lower()), None)
+        if exata or len(achadas) == 1:
+            albion_id = (exata or achadas[0])["id"]
+        elif achadas:
+            nomes = "\n".join(f"- {g['n']}" + (f" [{g['a']}]" if g["a"] else "") for g in achadas[:10])
+            await interaction.followup.send(f"Achei mais de uma guilda com \"{texto}\". Rode o comando de novo e escolha uma na lista:\n{nomes}", ephemeral=True)
+            return
+    if not albion_id:
+        await interaction.followup.send("❌ Nao encontrei essa guilda nesse servidor do Albion. Confira o nome e o servidor (Americas, Europa ou Asia).", ephemeral=True)
+        return
+    info = await asyncio.to_thread(fetch_albion_guild_info, regiao, albion_id)
+    if not info:
+        await interaction.followup.send("⚠️ A API do Albion nao respondeu agora. Tente de novo em alguns minutos.", ephemeral=True)
+        return
+    link = {
+        "s": regiao, "id": albion_id, "n": info.get("Name") or "?",
+        "a": info.get("AllianceTag") or info.get("AllianceName") or "",
+        "por": str(interaction.user.id), "por_nome": interaction.user.display_name,
+        "em": int(time.time()), "origem": "discord",
+    }
+    save_albion_guild(link)
+    await asyncio.to_thread(_avisar_site_acompanhar, link)
+    await interaction.followup.send(content="✅ Guilda vinculada a este servidor. O painel do site ja mostra ela para quem administra o servidor.", embed=_embed_guilda(link, info), ephemeral=True)
+
+
+@guilda_group.command(name="ver", description="Mostra a guilda do Albion ligada a este servidor")
+async def guilda_ver(interaction: discord.Interaction):
+    set_current_guild(interaction.guild_id)
+    link = load_albion_guild()
+    if not link:
+        await interaction.response.send_message("Nenhuma guilda do Albion ligada a este servidor ainda. Um admin pode ligar com `/guilda vincular`.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    info = await asyncio.to_thread(fetch_albion_guild_info, link["s"], link["id"], 20)
+    await interaction.followup.send(embed=_embed_guilda(link, info))
+
+
+@guilda_group.command(name="desvincular", description="[admin] Remove a guilda do Albion ligada a este servidor")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def guilda_desvincular(interaction: discord.Interaction):
+    set_current_guild(interaction.guild_id)
+    link = load_albion_guild()
+    if not link:
+        await interaction.response.send_message("Nao ha guilda ligada a este servidor.", ephemeral=True)
+        return
+    clear_albion_guild()
+    await interaction.response.send_message(f"✅ A guilda **{link['n']}** foi desligada deste servidor.", ephemeral=True)
+
+
 bot.tree.add_command(classes_group)
+bot.tree.add_command(guilda_group)
 bot.tree.add_command(evento_group)
 bot.tree.add_command(comp_group)
 bot.tree.add_command(saldo_group)
@@ -3670,7 +3785,9 @@ bot.tree.add_command(saldo_group)
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     set_current_guild(interaction.guild_id)
     if isinstance(error, app_commands.MissingPermissions):
-        msg = "❌ Voce nao tem permissao pra usar esse comando (precisa de Gerenciar Cargos)."
+        nomes = {"manage_roles": "Gerenciar Cargos", "manage_guild": "Gerenciar Servidor", "administrator": "Administrador"}
+        faltam = ", ".join(nomes.get(p, p) for p in getattr(error, "missing_permissions", [])) or "Gerenciar Cargos"
+        msg = f"❌ Voce nao tem permissao pra usar esse comando (precisa de {faltam})."
     else:
         print(f"[erro] Comando falhou: {error!r}")
         msg = f"⚠️ Deu erro: {error}"
