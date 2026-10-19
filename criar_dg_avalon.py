@@ -5,7 +5,7 @@ import copy, json, sys, time
 sys.path.insert(0, "/home/ubuntu/eventbot")
 import albion_shared as shared
 
-GID = "576409638031851541"
+GID = sys.argv[1] if len(sys.argv) > 1 else "576409638031851541"
 shared.set_current_guild(GID)
 
 def e(item, *swaps):
@@ -98,7 +98,7 @@ for ordem, (sid, nome, emoji, loot, build_nome) in enumerate(SLOTS, start=1):
     comp["slots"].append({
         "id": sid, "nome": nome, "cargo": nome, "vagas": 1, "ordem": ordem, "role_id": None,
         "item_id": builds[0]["item_id"] if builds else None, "emoji_id": None,
-        "emoji": emoji, "loot": loot, "builds": builds,
+        "emoji": emoji, "loot": loot, "builds": builds, "build_id": por_id.get(build_nome) if build_nome else None,
     })
 templates = shared.load_templates(GID)
 templates = [t for t in templates if t["id"] != comp["id"]] + [comp]

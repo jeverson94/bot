@@ -4328,7 +4328,10 @@ async def _internal_nivel(request):
     nivel = _nivel(membro, guild)
     if nivel is None and membro.guild_permissions.manage_roles:
         nivel = "caller"
-    return _iweb.json_response({"nivel": nivel, "no_servidor": True, "nome": membro.display_name})
+    return _iweb.json_response({
+        "nivel": nivel, "no_servidor": True, "nome": membro.display_name,
+        "guild_name": guild.name, "guild_icon": guild.icon.key if guild.icon else None,
+    })
 
 
 async def _internal_membros(request):

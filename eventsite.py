@@ -1896,6 +1896,33 @@ def require_session():
     return s
 
 
+_NIVEL_CACHE = {}
+
+
+def _guildas_extras(session):
+    """Servidores com o bot onde a pessoa e admin/gestor/caller mas que nao
+    estavam na lista do login (bot adicionado depois, cargo dado depois).
+    Pergunta pro bot, com cache de 60s por pessoa."""
+    did = str(session.get("discord_id") or "")
+    if not did:
+        return []
+    agora = time.time()
+    c = _NIVEL_CACHE.get(did)
+    if c and agora - c[0] < 60:
+        return c[1]
+    conhecidos = {str(g.get("id")) for g in session.get("eligible_guilds", [])}
+    extras = []
+    for gid in sorted(_tenant_guild_ids()):
+        if not gid.isdigit() or gid in conhecidos:
+            continue
+        resp, status = _internal_call("GET", "/nivel", guild_id=gid, user_id=did)
+        if status == 200 and resp.get("nivel"):
+            extras.append({"id": gid, "name": resp.get("guild_name") or f"Guilda {gid}",
+                           "icon": resp.get("guild_icon"), "nivel": resp["nivel"]})
+    _NIVEL_CACHE[did] = (agora, extras)
+    return extras
+
+
 def _usable_workspaces(session):
     """Workspaces (guilda ou pessoal) que esse usuario pode USAR agora - tem
     slot ATIVO comprado pra eles. Fonte da verdade e slots.json, nao a
@@ -1905,6 +1932,8 @@ def _usable_workspaces(session):
     workspace_id e label - da pra ter varios)."""
     discord_id = session.get("discord_id")
     eligible_by_id = {g["id"]: g for g in session.get("eligible_guilds", [])}
+    for g in _guildas_extras(session):
+        eligible_by_id.setdefault(g["id"], g)
     usable = []
     for slot in shared.slots_for_user(discord_id):
         if slot.get("type") == "guild":
@@ -2989,6 +3018,222 @@ def api_equipe_alterar():
     return jsonify({"ok": True})
 
 
+# =========================================================================
+# SERVIDOR (site novo): builds e composicoes do servidor do Discord, os
+# mesmos dados que o bot usa no /ping-conteudo. Caller, gestor ou admin.
+# =========================================================================
+
+PAPEL_SITE_PRA_BOT = {"dtank": "maintank", "healer": "cura", "battlemount": "montaria"}
+PAPEL_BOT_PRA_SITE = {v: k for k, v in PAPEL_SITE_PRA_BOT.items()}
+
+
+def _require_equipe(session, guild_id):
+    nivel = _nivel_site(session, guild_id)
+    if nivel is None:
+        abort(403)
+    return nivel
+
+
+def _equip_limpo(raw):
+    out = {}
+    for sd in shared.EQUIP_SLOTS:
+        v = (raw or {}).get(sd["key"])
+        if isinstance(v, str):
+            v = {"item": v, "swaps": []}
+        if not isinstance(v, dict):
+            continue
+        item = (v.get("item") or None)
+        swaps = [str(x) for x in (v.get("swaps") or []) if x][:8]
+        if item or swaps:
+            out[sd["key"]] = {"item": str(item) if item else None, "swaps": swaps}
+    return out
+
+
+def _build_pro_site(b):
+    return {
+        "id": b["id"], "nome": b.get("nome"), "item_id": b.get("item_id"),
+        "papel": PAPEL_BOT_PRA_SITE.get(b.get("papel"), b.get("papel")),
+        "categoria": b.get("categoria"), "notas": b.get("notas") or "",
+        "equip": shared.get_build_equip(b), "publica": b.get("visibility") == "shared",
+        "public_id": f"{shared.get_current_guild()}:{b['id']}" if b.get("visibility") == "shared" else None,
+        "atualizado": int((b.get("atualizado_em") or b.get("shared_at") or 0) * 1000),
+    }
+
+
+@app.route("/api/servidor/builds")
+def api_servidor_builds():
+    session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
+    return jsonify({"ok": True, "builds": [_build_pro_site(b) for b in shared.load_build_library(guild_id)]})
+
+
+@app.route("/api/servidor/builds", methods=["POST"])
+def api_servidor_builds_salvar():
+    """Cria ou atualiza uma build da biblioteca do servidor. Com 'id' atualiza
+    essa; sem id cria uma nova (id gerado pelo nome)."""
+    session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
+    body = request.get_json(silent=True) or {}
+    nome = (body.get("nome") or "").strip()[:80] or "Build sem nome"
+    equip = _equip_limpo(body.get("equip"))
+    papel = PAPEL_SITE_PRA_BOT.get(body.get("papel"), body.get("papel"))
+    if papel not in BUILD_ROLES:
+        papel = None
+    library = shared.load_build_library(guild_id)
+    bid = (body.get("id") or "").strip()
+    build = next((b for b in library if b["id"] == bid), None) if bid else None
+    if build is None:
+        bid = shared._slug(nome) or "build"
+        base, n = bid, 2
+        while any(b["id"] == bid for b in library):
+            bid = f"{base}_{n}"
+            n += 1
+        build = {"id": bid, "arma_nome": None, "emoji_id": None}
+        library.append(build)
+    build.update({
+        "nome": nome, "equip": equip, "papel": papel,
+        "item_id": (equip.get("mainhand") or {}).get("item"),
+        "notas": (body.get("notas") or "")[:500], "atualizado_em": time.time(),
+    })
+    if body.get("publica") is not None:
+        if body.get("publica"):
+            build["visibility"] = "shared"
+            build.setdefault("shared_at", int(time.time()))
+            build["shared_by_name"] = session.get("global_name") or session.get("username") or "Anonimo"
+            build["shared_by_discord_id"] = session.get("discord_id")
+            build["shared_workspace_id"] = guild_id
+            cat = body.get("categoria")
+            build["categoria"] = cat if cat in BUILD_CATEGORIES else (build.get("categoria") or "Sem categoria")
+        else:
+            build["visibility"] = "private"
+    shared.save_build_library(library, guild_id)
+    return jsonify({"ok": True, "build": _build_pro_site(build)})
+
+
+@app.route("/api/servidor/builds/<build_id>", methods=["DELETE"])
+def api_servidor_builds_apagar(build_id):
+    session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
+    library = [b for b in shared.load_build_library(guild_id) if b["id"] != build_id]
+    shared.save_build_library(library, guild_id)
+    return jsonify({"ok": True})
+
+
+def _comp_pro_site(t):
+    partes, ordem = {}, []
+    for s in t.get("slots") or []:
+        pn = s.get("party") or "Party 1"
+        if pn not in partes:
+            partes[pn] = []
+            ordem.append(pn)
+        b = (s.get("builds") or [None])[0] or {}
+        for _ in range(max(1, int(s.get("vagas") or 1))):
+            partes[pn].append({
+                "nome": s.get("nome"), "papel": s.get("papel") or "", "item_id": b.get("item_id") or s.get("item_id"),
+                "emoji": s.get("emoji") or "", "loot": s.get("loot") or "", "obs": s.get("obs") or "",
+                "build_id": s.get("build_id") or "",
+            })
+    tipos = {c["id"]: c["nome"] for c in shared.load_content_types()}
+    return {"id": t["id"], "nome": t["nome"], "conteudo": tipos.get(t.get("conteudo_id")) or "",
+            "partes": [{"nome": n, "vagas": partes[n]} for n in ordem]}
+
+
+@app.route("/api/servidor/comps")
+def api_servidor_comps():
+    session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
+    return jsonify({"ok": True, "comps": [_comp_pro_site(t) for t in shared.load_templates(guild_id)],
+                    "conteudos": [c["nome"] for c in shared.load_content_types()]})
+
+
+@app.route("/api/servidor/comps", methods=["POST"])
+def api_servidor_comps_salvar():
+    """Salva uma composicao vinda do editor do site: {id?, nome, conteudo,
+    partes: [{nome, vagas: [{nome, papel, item_id, emoji, loot, obs, build_id}]}]}.
+    Cada vaga vira um slot do bot (1 vaga). A build ligada e copiada da
+    biblioteca do servidor pro slot, que e o que o bot manda por DM."""
+    session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
+    body = request.get_json(silent=True) or {}
+    nome = (body.get("nome") or "").strip()[:80] or "Nova composição"
+    library = {b["id"]: b for b in shared.load_build_library(guild_id)}
+    tipos = shared.load_content_types()
+    conteudo = (body.get("conteudo") or "").strip()[:60]
+    conteudo_id = None
+    if conteudo:
+        achado = next((c for c in tipos if c["nome"].lower() == conteudo.lower()), None)
+        if achado is None:
+            achado = {"id": shared._slug(conteudo) or "conteudo", "nome": conteudo}
+            tipos.append(achado)
+            shared.save_content_types(tipos)
+        conteudo_id = achado["id"]
+
+    slots, usados = [], set()
+    for parte in (body.get("partes") or [])[:20]:
+        pn = (parte.get("nome") or "Party").strip()[:40]
+        for v in (parte.get("vagas") or [])[:50]:
+            vnome = (v.get("nome") or "").strip()[:60] or "Vaga"
+            sid = shared._slug(vnome) or "vaga"
+            base, n = sid, 2
+            while sid in usados:
+                sid = f"{base}_{n}"
+                n += 1
+            usados.add(sid)
+            item_id = (v.get("item_id") or "").strip() or None
+            build_id = (v.get("build_id") or "").strip()
+            builds = []
+            if build_id in library:
+                lb = library[build_id]
+                builds = [{"nome": lb.get("nome"), "item_id": lb.get("item_id"), "arma_nome": None,
+                           "emoji_id": None, "equip": copy.deepcopy(lb.get("equip") or {})}]
+                item_id = item_id or lb.get("item_id")
+            elif item_id:
+                builds = [{"nome": vnome, "item_id": item_id, "arma_nome": None, "emoji_id": None}]
+            slots.append({
+                "id": sid, "nome": vnome, "cargo": vnome, "vagas": 1, "ordem": len(slots) + 1, "role_id": None,
+                "item_id": item_id, "emoji_id": None, "emoji": (v.get("emoji") or "").strip()[:8] or None,
+                "loot": (v.get("loot") or "").strip()[:80] or None, "obs": (v.get("obs") or "").strip()[:120] or None,
+                "papel": (v.get("papel") or "").strip()[:20] or None, "party": pn,
+                "build_id": build_id or None, "builds": builds,
+            })
+
+    templates = shared.load_templates(guild_id)
+    cid = (body.get("id") or "").strip()
+    t = next((x for x in templates if x["id"] == cid), None) if cid else None
+    if t is None:
+        cid = shared._slug(nome) or "comp"
+        base, n = cid, 2
+        while any(x["id"] == cid for x in templates):
+            cid = f"{base}_{n}"
+            n += 1
+        t = {"id": cid}
+        templates.append(t)
+    t.update({"nome": nome, "conteudo_id": conteudo_id, "slots": slots})
+    if any(s.get("loot") for s in slots):
+        t["formato"] = "lista"
+    shared.save_templates(templates, guild_id)
+    return jsonify({"ok": True, "comp": _comp_pro_site(t)})
+
+
+@app.route("/api/servidor/comps/<comp_id>", methods=["DELETE"])
+def api_servidor_comps_apagar(comp_id):
+    session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
+    templates = [t for t in shared.load_templates(guild_id) if t["id"] != comp_id]
+    shared.save_templates(templates, guild_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/servidor/vagas-texto/<comp_id>")
+def api_servidor_vagas_texto(comp_id):
+    session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
+    t = next((x for x in shared.load_templates(guild_id) if x["id"] == comp_id), None)
+    if not t:
+        abort(404)
+    return jsonify({"ok": True, "texto": shared.vagas_texto_da_comp(t)})
+
+
 @app.route("/api/membros")
 def api_membros():
     """Busca membros do servidor pelo nome (pra escolher quem liberar ou
@@ -3145,6 +3390,7 @@ def api_compositions():
 @app.route("/api/pings")
 def api_pings():
     session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
     pings = shared.load_pings(guild_id)
     limit = request.args.get("limit", "50")
     limit = int(limit) if limit.isdigit() else 50
@@ -3204,6 +3450,7 @@ def api_ping_detail(key):
 @app.route("/api/discord/channels")
 def api_discord_channels():
     session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
     data, status = _internal_call("GET", "/channels", guild_id=guild_id)
     return jsonify(data), status
 
@@ -3211,6 +3458,7 @@ def api_discord_channels():
 @app.route("/api/pings", methods=["POST"])
 def api_pings_create():
     session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
     body = request.get_json(silent=True) or {}
     data, status = _internal_call(
         "POST", "/pings", guild_id=guild_id,
@@ -3230,6 +3478,7 @@ def api_pings_create():
 @app.route("/api/pings/<key>", methods=["PUT"])
 def api_pings_edit(key):
     session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
     body = request.get_json(silent=True) or {}
     payload = {k: body[k] for k in ("titulo", "local", "fee", "horario", "vagas") if k in body}
     data, status = _internal_call("PUT", f"/pings/{key}", guild_id=guild_id, **payload)
@@ -3239,6 +3488,7 @@ def api_pings_edit(key):
 @app.route("/api/pings/<key>/encerrar", methods=["POST"])
 def api_pings_encerrar(key):
     session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
     data, status = _internal_call("POST", f"/pings/{key}/encerrar", guild_id=guild_id)
     return jsonify(data), status
 
@@ -3246,6 +3496,7 @@ def api_pings_encerrar(key):
 @app.route("/api/pings/<key>/split", methods=["POST"])
 def api_pings_split(key):
     session, guild_id = require_guild_session()
+    _require_equipe(session, guild_id)
     body = request.get_json(silent=True) or {}
     modo = body.get("modo")
     if modo not in ("dividir", "comprador", "saldar"):
