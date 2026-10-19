@@ -72,7 +72,7 @@ from albion_shared import (
     load_reputation, save_reputation, add_rating, compute_reputation_stats,
     set_current_guild, list_tenant_guild_ids, get_current_guild,
     load_saldos, save_saldos, load_saldo_gestores, save_saldo_gestores,
-    load_permissoes, set_permissao, nivel_permissao, ajustar_saldo,
+    load_permissoes, set_permissao, nivel_permissao, ajustar_saldo, vagas_texto_da_comp,
     owner_discord_id_for_guild, is_saldo_gestor, add_saldo, quitar_saldo,
 )
 
@@ -1752,6 +1752,55 @@ async def _dm_build_para_funcao(interaction, ping, funcao):
         print(f"[aviso] falha ao mandar build no privado de {interaction.user.id}: {e}")
 
 
+_KEYCAPS = ["0️⃣", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+
+
+def _numero_emoji(n):
+    """1 -> 1️⃣, 10 -> 🔟, 11 -> 1️⃣1️⃣ (igual os pings feitos na mao)."""
+    if n == 10:
+        return "\U0001F51F"
+    return "".join(_KEYCAPS[int(d)] for d in str(n))
+
+
+def _icone_do_slot(nome_funcao, comp):
+    alvo = _strip_accents(nome_funcao).lower()
+    for slot in ((comp or {}).get("slots") or []):
+        if _strip_accents(slot["nome"]).lower() == alvo and slot.get("emoji"):
+            return slot["emoji"]
+    return None
+
+
+def _preparar_funcoes(texto, comp):
+    """Texto de vagas -> lista de funcoes do ping. Se alguma linha tiver loot
+    ('Funcao | Loot: X') ou a composicao estiver no formato lista, o ping sai
+    no formato lista numerada (1️⃣ 🛡️ MAIN TANK @fulano 📦 Loot: ...) e cada
+    funcao usa o icone definido no slot da composicao."""
+    funcoes = _parse_slots_texto(texto)
+    if not funcoes:
+        return [], False
+    lista = any(f.get("loot") for f in funcoes) or bool(comp and comp.get("formato") == "lista")
+    funcoes = _assign_emojis(funcoes)
+    for f in funcoes:
+        f["claimed"] = []
+        f["extra"] = []
+        f["build_ref"] = _match_build_ref(f["nome"], comp) if comp else None
+        if lista:
+            icone = _icone_do_slot(f["nome"], comp)
+            if icone:
+                f["emoji"] = icone
+    return funcoes, lista
+
+
+def _linhas_ping_lista(ping):
+    linhas = []
+    for i, f in enumerate(ping["funcoes"], start=1):
+        quem = " ".join(f"<@{uid}>" for uid in f["claimed"])
+        vagas = f" ({len(f['claimed'])}/{f['vagas']})" if f["vagas"] > 1 else ""
+        loot = f" \U0001F4E6 Loot: {f['loot']}" if f.get("loot") else ""
+        linhas.append(f"{_numero_emoji(i)} {f['emoji']} **{f['nome'].upper()}**{vagas} {quem}{loot}".replace("  ", " "))
+    return linhas
+
+
 def _build_ping_embed(ping):
     """Embed do painel do ping, em colunas por funcao (igual o visual de
     referencia que o usuario mandou): 1a prioridade numerada, depois 2a
@@ -1778,7 +1827,11 @@ def _build_ping_embed(ping):
     elif ping.get("canal_voz_id"):
         topo.append("\U0001F50A Sala de voz criada")
 
-    embed = discord.Embed(title=ping["titulo"], description="\n".join(topo), color=GOLD)
+    if ping.get("formato") == "lista":
+        corpo = "\n".join(topo) + "\n\n" + "\n\n".join(_linhas_ping_lista(ping))
+        embed = discord.Embed(title=ping["titulo"], description=corpo[:4096], color=GOLD)
+    else:
+        embed = discord.Embed(title=ping["titulo"], description="\n".join(topo), color=GOLD)
 
     contador = [0]
 
@@ -1816,7 +1869,7 @@ def _build_ping_embed(ping):
         adicionados += 1
         return True
 
-    if pt1_fields:
+    if pt1_fields and ping.get("formato") != "lista":
         _add_field("⭐ 1ª Prioridade", "​", False)
         for nome, valor in pt1_fields:
             if not _add_field(nome, valor, True):
@@ -1854,8 +1907,9 @@ class PingFuncaoView(discord.ui.View):
             preenchido = len(f["claimed"])
             total = f["vagas"]
             full = preenchido >= total
+            rotulo = f"{idx + 1}. {f['nome']}" if f.get("loot") else f["nome"]
             btn = discord.ui.Button(
-                label=f"{f['nome']} ({preenchido}/{total})"[:80],
+                label=f"{rotulo} ({preenchido}/{total})"[:80],
                 style=discord.ButtonStyle.success if full else discord.ButtonStyle.secondary,
                 custom_id=f"pingfn:{ping_id}:{idx}",
                 emoji=f["emoji"],
@@ -2266,8 +2320,7 @@ class PingSlotPickerSelect(discord.ui.Select):
         # select) - 1 linha por funcao selecionada, sempre 1 vaga; pra mais
         # de 1 vaga da mesma funcao, repete o nome manualmente no campo
         # depois (o campo continua editavel)
-        linhas = [slot["nome"] for slot in (self.comp.get("slots") or []) if slot["id"] in self.values]
-        prefill = "\n".join(linhas)
+        prefill = vagas_texto_da_comp(self.comp, set(self.values))
         await interaction.response.send_modal(PingConteudoModal(self.canal, self.comp, vagas_prefill=prefill))
 
 
@@ -2314,15 +2367,10 @@ class PingConteudoModal(discord.ui.Modal, title="Criar ping de conteudo"):
         set_current_guild(interaction.guild_id)
         await interaction.response.defer(ephemeral=True)
 
-        funcoes = _parse_slots_texto(str(self.vagas_input.value))
+        funcoes, formato_lista = _preparar_funcoes(str(self.vagas_input.value), self.comp)
         if not funcoes:
             await interaction.followup.send("❌ Não entendi nenhuma vaga — escreva uma função por linha (ex: Tank, Tank, DPS).", ephemeral=True)
             return
-        funcoes = _assign_emojis(funcoes)
-        for f in funcoes:
-            f["claimed"] = []
-            f["extra"] = []
-            f["build_ref"] = _match_build_ref(f["nome"], self.comp) if self.comp else None
 
         titulo = str(self.titulo_input.value).strip() or (self.comp["nome"] if self.comp else "Ping de conteúdo")
         local = str(self.local_input.value).strip()
@@ -2372,6 +2420,8 @@ class PingConteudoModal(discord.ui.Modal, title="Criar ping de conteudo"):
             "banco": [], "ausentes": [],
             "canal_voz_id": None, "contagem_iniciada": False, "participantes_tempo": {},
         }
+        if formato_lista:
+            ping["formato"] = "lista"
 
         await create_live_event(ping)
 
@@ -4338,14 +4388,9 @@ async def _internal_create_ping(request):
     if not comp.get("slots"):
         return _iweb.json_response({"error": "essa composicao nao tem slots/builds ainda"}, status=400)
 
-    funcoes = _parse_slots_texto(str(data.get("vagas_texto") or ""))
+    funcoes, formato_lista = _preparar_funcoes(str(data.get("vagas_texto") or ""), comp)
     if not funcoes:
         return _iweb.json_response({"error": "nenhuma vaga entendida - uma funcao por linha"}, status=400)
-    funcoes = _assign_emojis(funcoes)
-    for f in funcoes:
-        f["claimed"] = []
-        f["extra"] = []
-        f["build_ref"] = _match_build_ref(f["nome"], comp)
 
     titulo = (data.get("titulo") or "").strip() or comp["nome"]
     local = (data.get("local") or "").strip()
@@ -4389,6 +4434,8 @@ async def _internal_create_ping(request):
         "banco": [], "ausentes": [],
         "canal_voz_id": None, "contagem_iniciada": False, "participantes_tempo": {},
     }
+    if formato_lista:
+        ping["formato"] = "lista"
 
     await create_live_event(ping)
 

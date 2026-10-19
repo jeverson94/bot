@@ -2172,12 +2172,26 @@ PING_NOVO_TPL = """
     </div>
   </div>
   <div class="field">
-    <label>Vagas (uma funcao por linha) <span class="info-tip" data-tip="Repita o nome da funcao em varias linhas pra somar vagas. Ex: Tank, Tank, Healer, DPS, DPS.">i</span></label>
+    <label>Vagas (uma funcao por linha) <span class="info-tip" data-tip="Repita o nome da funcao em varias linhas pra somar vagas. Pra mostrar o loot de cada vaga, escreva: Main Tank | Loot: Mapas">i</span></label>
     <textarea name="vagas_texto" placeholder="Tank&#10;Tank&#10;Healer pt&#10;Suporte&#10;DPS&#10;DPS" required></textarea>
   </div>
   <button type="submit" class="btn">Criar ping</button>
   <a href="{{ url_for('pings_painel') }}" class="btn secondary">Cancelar</a>
 </form>
+<script>
+(function () {
+  const VAGAS = {{ composicoes|map(attribute='vagas_texto', default='')|list|tojson }};
+  const IDS = {{ composicoes|map(attribute='id')|list|tojson }};
+  const sel = document.querySelector('select[name="composicao_id"]');
+  const area = document.querySelector('textarea[name="vagas_texto"]');
+  let auto = true;
+  area.addEventListener('input', function () { auto = false; });
+  sel.addEventListener('change', function () {
+    const i = IDS.indexOf(sel.value);
+    if (i >= 0 && (auto || !area.value.trim())) { area.value = VAGAS[i] || ''; auto = true; }
+  });
+})();
+</script>
 """
 
 PING_DETALHE_TPL = """
@@ -2358,7 +2372,8 @@ def pings_painel_novo():
 
     canais_data, _ = _internal_call("GET", "/channels", guild_id=guild_id)
     templates = shared.load_templates(guild_id)
-    composicoes = [{"id": t["id"], "nome": t["nome"], "slots_count": len(t.get("slots", []))} for t in templates if t.get("slots")]
+    composicoes = [{"id": t["id"], "nome": t["nome"], "slots_count": len(t.get("slots", [])),
+                    "vagas_texto": shared.vagas_texto_da_comp(t)} for t in templates if t.get("slots")]
     html = render_template_string(
         PING_NOVO_TPL, canais=canais_data.get("channels", []), composicoes=composicoes, error_banner="",
     )

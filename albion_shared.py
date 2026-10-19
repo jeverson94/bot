@@ -684,14 +684,36 @@ def _parse_slots_texto(texto):
     vagas = {}
     for parte in partes:
         nome = parte.strip()
+        loot = None
+        # "Funcao | Loot: Botas" (ou so "Funcao | Botas"): cada loot diferente
+        # vira uma funcao separada, mesmo com o mesmo nome
+        if "|" in nome:
+            nome, loot = [x.strip() for x in nome.split("|", 1)]
+            loot = re.sub(r"^loot\s*:\s*", "", loot, flags=re.IGNORECASE).strip() or None
         if not nome:
             continue
-        chave = nome.lower()
+        chave = nome.lower() + ("|" + loot.lower() if loot else "")
         if chave not in vagas:
             vagas[chave] = {"nome": nome, "vagas": 0}
+            if loot:
+                vagas[chave]["loot"] = loot
             ordem.append(chave)
         vagas[chave]["vagas"] += 1
     return [vagas[k] for k in ordem]
+
+
+def vagas_texto_da_comp(comp, slot_ids=None):
+    """Texto de vagas (uma linha por vaga) a partir dos slots da composicao,
+    no formato que o _parse_slots_texto entende. Slot com loot sai como
+    'Nome | Loot: X'."""
+    linhas = []
+    for slot in (comp.get("slots") or []):
+        if slot_ids is not None and slot["id"] not in slot_ids:
+            continue
+        linha = slot["nome"] + (f" | Loot: {slot['loot']}" if slot.get("loot") else "")
+        repetir = 1 if slot_ids is not None else max(1, int(slot.get("vagas") or 1))
+        linhas.extend([linha] * repetir)
+    return "\n".join(linhas)
 
 
 _EMOJI_THEMES = [
