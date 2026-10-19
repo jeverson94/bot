@@ -144,7 +144,7 @@ def _cors(response):
     # API publica de leitura (sem dado sensivel) consumida pelo site novo
     # (dominio diferente, hospedado fora daqui) - libera geral.
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
