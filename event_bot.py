@@ -60,7 +60,7 @@ from discord.ext import commands, tasks
 from PIL import Image, ImageDraw, ImageFont
 
 from albion_shared import (
-    BASE_DIR, GUILD_TAG, API_SEARCH, RENDER_BASE, BUYER_FEE, GOLD, TIMEZONE,
+    BASE_DIR, GUILD_DATA_DIR, GUILD_TAG, API_SEARCH, RENDER_BASE, BUYER_FEE, GOLD, TIMEZONE,
     _load_json, _save_json, _slug, _fmt_duration, _fmt_prata, _looks_like_item_id,
     resolve_item_id_by_name, _parse_builds_texto, _parse_data_hora, _strip_accents,
     DEFAULT_CLASSES, load_classes, save_classes, _slots_from_legacy_classes,
@@ -3658,6 +3658,135 @@ async def sync_cmd(interaction: discord.Interaction):
     bot.tree.copy_global_to(guild=interaction.guild)
     synced = await bot.tree.sync(guild=interaction.guild)
     await interaction.followup.send(f"✅ {len(synced)} comandos sincronizados neste servidor.", ephemeral=True)
+
+
+# =========================
+# /comandos + checagem de permissoes
+# =========================
+
+FRONTEND_URL_PUBLICO = os.environ.get("FRONTEND_URL", "https://seagreen-rat-589164.hostingersite.com")
+
+# Permissoes que o bot usa de verdade (criar categoria/call/role, mover membro
+# entre calls, abrir topico, mandar embed/imagem, marcar cargo).
+PERMISSOES_NECESSARIAS = {
+    "view_channel": "Ver canais",
+    "send_messages": "Enviar mensagens",
+    "send_messages_in_threads": "Enviar mensagens em tópicos",
+    "create_public_threads": "Criar tópicos públicos",
+    "manage_threads": "Gerenciar tópicos",
+    "embed_links": "Inserir links",
+    "attach_files": "Anexar arquivos",
+    "read_message_history": "Ver histórico de mensagens",
+    "mention_everyone": "Mencionar @everyone e todos os cargos",
+    "add_reactions": "Adicionar reações",
+    "use_external_emojis": "Usar emojis externos",
+    "manage_channels": "Gerenciar canais",
+    "manage_roles": "Gerenciar cargos",
+    "connect": "Conectar (voz)",
+    "move_members": "Mover membros",
+}
+
+# Ordem e titulo de cada secao do /comandos (pelo nome do comando raiz).
+SECOES_COMANDOS = [
+    ("Eventos", ["evento", "criar-evento", "iniciar-evento"]),
+    ("Pings de conteúdo", ["ping-conteudo", "encerrar-ping", "ping-funcao"]),
+    ("Composições", ["comp"]),
+    ("Classes (roster simples)", ["classes"]),
+    ("Saldo e loot", ["saldo", "saldo-consultar", "saldo-quitar", "saldo-gestor"]),
+    ("Jogadores", ["perfil"]),
+    ("Ajuda e admin", ["comandos", "sync"]),
+]
+
+
+def _permissoes_faltando(guild):
+    me = guild.me if guild else None
+    if not me:
+        return []
+    perms = me.guild_permissions
+    if perms.administrator:
+        return []
+    return [nome for chave, nome in PERMISSOES_NECESSARIAS.items() if not getattr(perms, chave, False)]
+
+
+def _linhas_comando(cmd):
+    """Uma linha por comando (grupos viram uma linha por subcomando)."""
+    if isinstance(cmd, app_commands.Group):
+        return [f"`/{cmd.name} {sub.name}` {sub.description}" for sub in cmd.commands]
+    return [f"`/{cmd.name}` {cmd.description}"]
+
+
+@bot.tree.command(name="comandos", description="Lista todos os comandos do bot e o que cada um faz")
+async def comandos_cmd(interaction: discord.Interaction):
+    todos = {c.name: c for c in bot.tree.get_commands()}
+    usados = set()
+    embed = discord.Embed(
+        title="Comandos do bot",
+        description=(
+            "Os marcados com **[organizador]**, **[gestor de saldo]**, **[contratante]** ou **[admin]** "
+            "só funcionam pra quem tem essa função. Dá pra fazer quase tudo também pelo site, "
+            f"no painel do servidor: {FRONTEND_URL_PUBLICO}"
+        ),
+        color=0xE2BC62,
+    )
+    for titulo, nomes in SECOES_COMANDOS:
+        linhas = []
+        for n in nomes:
+            if n in todos:
+                usados.add(n)
+                linhas += _linhas_comando(todos[n])
+        if linhas:
+            embed.add_field(name=titulo, value="\n".join(linhas)[:1024], inline=False)
+    resto = [ln for n, c in sorted(todos.items()) if n not in usados for ln in _linhas_comando(c)]
+    if resto:
+        embed.add_field(name="Outros", value="\n".join(resto)[:1024], inline=False)
+
+    faltando = _permissoes_faltando(interaction.guild)
+    if faltando:
+        embed.add_field(
+            name="⚠️ Faltam permissões pro bot",
+            value="Dê ao cargo do bot: " + ", ".join(faltando) + ". Sem isso alguns comandos falham.",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Servidor novo: cria a pasta de dados (assim ele ja aparece no site pro
+    admin logar) e manda uma mensagem de boas-vindas com o que falta configurar."""
+    set_current_guild(guild.id)
+    try:
+        (GUILD_DATA_DIR / str(guild.id)).mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"[erro] nao criei a pasta da guilda {guild.id}: {e}")
+
+    faltando = _permissoes_faltando(guild)
+    texto = (
+        f"Opa! O **{bot.user.name}** chegou no **{guild.name}**.\n\n"
+        "• Use `/comandos` pra ver tudo o que o bot faz.\n"
+        f"• Pelo site dá pra montar composições, builds e criar eventos: {FRONTEND_URL_PUBLICO} "
+        "(entre com o Discord sendo admin deste servidor).\n"
+        f"• Em Configurações do servidor → Cargos, arraste o cargo **{bot.user.name}** pra cima "
+        "dos cargos de classe/função. O Discord não deixa o bot dar ou tirar um cargo que esteja acima do dele."
+    )
+    if faltando:
+        texto += "\n\n⚠️ Faltam permissões: " + ", ".join(faltando) + ". O jeito mais fácil é remover e adicionar o bot de novo pelo link de convite."
+
+    canal = guild.system_channel
+    if not canal or not canal.permissions_for(guild.me).send_messages:
+        canal = next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+    if canal:
+        try:
+            await canal.send(texto)
+            return
+        except discord.HTTPException:
+            pass
+    if guild.owner:
+        try:
+            await guild.owner.send(texto)
+        except discord.HTTPException:
+            pass
 
 
 bot.tree.add_command(classes_group)
