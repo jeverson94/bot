@@ -969,6 +969,90 @@ def add_saldo(guild_id, discord_id, nome, valor, motivo="Loot saldado", por_disc
     return atual["valor"]
 
 
+# =========================
+# PERMISSOES DA EQUIPE (por guilda)
+# =========================
+# Tres niveis, do maior pro menor:
+#   admin  - administrador do servidor (Administrador ou Gerenciar Servidor no
+#            Discord) ou o contratante do slot. Faz tudo e decide quem e o que.
+#   gestor - mexe no saldo (ver, adicionar, remover, quitar) e tambem pode pingar.
+#   caller - pode pingar conteudo, criar/encerrar eventos e montar composicoes.
+#            NAO mexe no saldo.
+# Cada nivel aceita pessoas (discord_id) e cargos do Discord (role_id).
+# Os gestores-pessoa continuam em saldo_gestores.json (compat com o que ja
+# existia); o resto fica em permissoes.json.
+
+NIVEIS_PERMISSAO = ("caller", "gestor")
+
+
+def load_permissoes(guild_id=None):
+    data = _load_json(_guild_file(guild_id, "permissoes.json"), {})
+    out = {}
+    for nivel in NIVEIS_PERMISSAO:
+        bloco = data.get(nivel) or {}
+        out[nivel] = {
+            "pessoas": [str(x) for x in bloco.get("pessoas", [])],
+            "cargos": [str(x) for x in bloco.get("cargos", [])],
+        }
+    # gestores-pessoa sempre vem do arquivo antigo (fonte unica)
+    out["gestor"]["pessoas"] = [str(x) for x in load_saldo_gestores(guild_id)]
+    return out
+
+
+def save_permissoes(perms, guild_id=None):
+    save_saldo_gestores(perms["gestor"]["pessoas"], guild_id)
+    data = {n: {"pessoas": perms[n]["pessoas"] if n != "gestor" else [], "cargos": perms[n]["cargos"]} for n in NIVEIS_PERMISSAO}
+    _save_json(_guild_file(guild_id, "permissoes.json"), data)
+
+
+def set_permissao(guild_id, nivel, tipo, alvo_id, adicionar=True):
+    """tipo = 'pessoas' ou 'cargos'. Devolve True se mudou algo."""
+    if nivel not in NIVEIS_PERMISSAO or tipo not in ("pessoas", "cargos"):
+        raise ValueError("nivel/tipo invalido")
+    perms = load_permissoes(guild_id)
+    lista = perms[nivel][tipo]
+    alvo_id = str(alvo_id)
+    if adicionar and alvo_id not in lista:
+        lista.append(alvo_id)
+    elif not adicionar and alvo_id in lista:
+        lista.remove(alvo_id)
+    else:
+        return False
+    save_permissoes(perms, guild_id)
+    return True
+
+
+def nivel_permissao(guild_id, discord_id, role_ids=(), eh_admin_discord=False):
+    """'admin', 'gestor', 'caller' ou None. role_ids = cargos que a pessoa
+    tem no servidor; eh_admin_discord = tem Administrador/Gerenciar Servidor."""
+    discord_id = str(discord_id)
+    if eh_admin_discord or discord_id == str(owner_discord_id_for_guild(guild_id)):
+        return "admin"
+    perms = load_permissoes(guild_id)
+    roles = {str(r) for r in role_ids}
+    for nivel in ("gestor", "caller"):
+        if discord_id in perms[nivel]["pessoas"] or roles & set(perms[nivel]["cargos"]):
+            return nivel
+    return None
+
+
+def ajustar_saldo(guild_id, discord_id, nome, valor, motivo, por_discord_id, por_nome=None):
+    """Ajuste manual do gestor: valor positivo adiciona, negativo remove."""
+    valor = float(valor)
+    if valor >= 0:
+        return add_saldo(guild_id, discord_id, nome, valor, motivo=motivo or "Ajuste manual",
+                         por_discord_id=por_discord_id, por_nome=por_nome)
+    novo = quitar_saldo(guild_id, discord_id, por_discord_id, por_nome=por_nome, valor=-valor,
+                        motivo=motivo or "Ajuste manual")
+    if nome:
+        data = load_saldos(guild_id)
+        entrada = data.get("saldos", {}).get(str(discord_id))
+        if entrada is not None and not entrada.get("nome"):
+            entrada["nome"] = nome
+            save_saldos(data, guild_id)
+    return novo
+
+
 def quitar_saldo(guild_id, discord_id, por_discord_id, por_nome=None, valor=None, motivo="Quitado pelo gestor"):
     """Zera (valor=None) ou desconta um valor especifico do saldo de
     discord_id. Retorna o novo saldo. Registra no historico quem deu a

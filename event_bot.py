@@ -72,6 +72,7 @@ from albion_shared import (
     load_reputation, save_reputation, add_rating, compute_reputation_stats,
     set_current_guild, list_tenant_guild_ids, get_current_guild,
     load_saldos, save_saldos, load_saldo_gestores, save_saldo_gestores,
+    load_permissoes, set_permissao, nivel_permissao, ajustar_saldo,
     owner_discord_id_for_guild, is_saldo_gestor, add_saldo, quitar_saldo,
 )
 
@@ -969,6 +970,63 @@ classes_group = app_commands.Group(name="classes", description="Gerenciar as cla
 evento_group = app_commands.Group(name="evento", description="Comandos de evento")
 comp_group = app_commands.Group(name="comp", description="Gerenciar composicoes (templates de evento com slots e builds/swap)")
 saldo_group = app_commands.Group(name="saldo", description="Comandos de saldo")
+permissao_group = app_commands.Group(name="permissao", description="[admin] Quem da equipe pode pingar e quem mexe no saldo")
+
+
+# ---- niveis de permissao (ver albion_shared.nivel_permissao) ----
+def _membro(user, guild):
+    if guild is None or user is None:
+        return None
+    if isinstance(user, discord.Member):
+        return user
+    return guild.get_member(getattr(user, "id", user))
+
+
+def _nivel(user, guild):
+    m = _membro(user, guild)
+    if m is None:
+        return None
+    p = m.guild_permissions
+    return nivel_permissao(guild.id, m.id, [r.id for r in m.roles], p.administrator or p.manage_guild)
+
+
+def _pode_pingar(user, guild):
+    m = _membro(user, guild)
+    if m is None:
+        return False
+    if m.guild_permissions.manage_roles:  # quem ja podia antes continua podendo
+        return True
+    return _nivel(m, guild) in ("admin", "gestor", "caller")
+
+
+def _pode_saldo(user, guild):
+    return _nivel(user, guild) in ("admin", "gestor")
+
+
+def _eh_admin(user, guild):
+    return _nivel(user, guild) == "admin"
+
+
+class SemPermissao(app_commands.CheckFailure):
+    pass
+
+
+def requer_pingar():
+    async def pred(interaction: discord.Interaction):
+        set_current_guild(interaction.guild_id)
+        if _pode_pingar(interaction.user, interaction.guild):
+            return True
+        raise SemPermissao(
+            "❌ Só caller, gestor de saldo ou admin do servidor pode usar esse comando. "
+            "Peça pra um admin te liberar com `/permissao adicionar`."
+        )
+    return app_commands.check(pred)
+
+
+MSG_SEM_SALDO = (
+    "❌ Só gestor de saldo ou admin do servidor mexe no saldo. "
+    "Um admin pode te liberar com `/permissao adicionar nivel:gestor`."
+)
 
 
 @classes_group.command(name="listar", description="Lista as classes configuradas")
@@ -990,7 +1048,7 @@ async def classes_listar(interaction: discord.Interaction):
     arma_nome="Nome da arma em portugues, se nao souber o Item ID",
     vagas="Limite de vagas nessa classe (deixe vazio = sem limite)",
 )
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def classes_adicionar(interaction: discord.Interaction, nome: str, cargo: str, item_id: str = None, arma_nome: str = None, vagas: int = None):
     set_current_guild(interaction.guild_id)
     await interaction.response.defer(ephemeral=True)
@@ -1016,7 +1074,7 @@ async def classes_adicionar(interaction: discord.Interaction, nome: str, cargo: 
 
 
 @classes_group.command(name="remover", description="Remove uma classe do roster pelo nome")
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def classes_remover(interaction: discord.Interaction, nome: str):
     set_current_guild(interaction.guild_id)
     classes = load_classes()
@@ -1221,7 +1279,7 @@ def _parse_classes_xlsx(raw_bytes):
 
 @classes_group.command(name="importar", description="Importa o roster a partir da planilha classes_evento_modelo.xlsx preenchida")
 @app_commands.describe(planilha="Arquivo .xlsx preenchido com o modelo")
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def classes_importar(interaction: discord.Interaction, planilha: discord.Attachment):
     set_current_guild(interaction.guild_id)
     await interaction.response.defer(ephemeral=True)
@@ -1252,7 +1310,7 @@ async def classes_importar(interaction: discord.Interaction, planilha: discord.A
 
 
 @classes_group.command(name="painel", description="Abre um painel interativo pra adicionar/editar/remover classes (sem decorar comando)")
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def classes_painel(interaction: discord.Interaction):
     set_current_guild(interaction.guild_id)
     embed = discord.Embed(
@@ -1301,7 +1359,7 @@ async def comp_listar(interaction: discord.Interaction):
 
 
 @comp_group.command(name="criar", description="Cria uma composicao vazia (depois adicione slots com /comp slot_adicionar)")
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def comp_criar(interaction: discord.Interaction, nome: str):
     set_current_guild(interaction.guild_id)
     templates = load_templates()
@@ -1316,7 +1374,7 @@ async def comp_criar(interaction: discord.Interaction, nome: str):
 
 @comp_group.command(name="remover", description="Remove uma composicao inteira")
 @app_commands.autocomplete(template=templates_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def comp_remover(interaction: discord.Interaction, template: str):
     set_current_guild(interaction.guild_id)
     templates = load_templates()
@@ -1337,7 +1395,7 @@ async def comp_remover(interaction: discord.Interaction, template: str):
     vagas="Vagas nesse slot (vazio = sem limite)",
 )
 @app_commands.autocomplete(template=templates_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def comp_slot_adicionar(interaction: discord.Interaction, template: str, nome: str, cargo: str, builds: str, vagas: int = None):
     set_current_guild(interaction.guild_id)
     await interaction.response.defer(ephemeral=True)
@@ -1365,7 +1423,7 @@ async def comp_slot_adicionar(interaction: discord.Interaction, template: str, n
 
 @comp_group.command(name="slot_remover", description="Remove um slot de uma composicao")
 @app_commands.autocomplete(template=templates_autocomplete, slot=slots_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def comp_slot_remover(interaction: discord.Interaction, template: str, slot: str):
     set_current_guild(interaction.guild_id)
     templates = load_templates()
@@ -1512,7 +1570,7 @@ class CompPainelView(discord.ui.View):
 
 
 @comp_group.command(name="painel", description="Painel interativo pra criar/editar composicoes e seus slots")
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def comp_painel(interaction: discord.Interaction):
     set_current_guild(interaction.guild_id)
     embed = discord.Embed(
@@ -1531,7 +1589,7 @@ async def eventos_abertos_autocomplete(interaction: discord.Interaction, current
 
 
 @bot.tree.command(name="ping-funcao", description="Publica o painel de funcoes (clique pra ser marcado e notificado)")
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def ping_funcao(interaction: discord.Interaction):
     set_current_guild(interaction.guild_id)
     await interaction.response.defer(ephemeral=True)
@@ -2079,9 +2137,7 @@ async def handle_ping_config(interaction: discord.Interaction, ping_id):
     if not ping:
         await interaction.response.send_message("❌ Ping não encontrado.", ephemeral=True)
         return
-    pode_encerrar = (interaction.user.id == ping.get("criado_por")) or (
-        interaction.guild and interaction.user.guild_permissions.manage_roles
-    )
+    pode_encerrar = (interaction.user.id == ping.get("criado_por")) or _pode_pingar(interaction.user, interaction.guild)
     sala_txt = "—"
     if ping.get("canal_voz_id"):
         voice_channel = interaction.guild.get_channel(ping["canal_voz_id"]) if interaction.guild else None
@@ -2132,9 +2188,9 @@ async def _iniciar_sala_ping_core(ping_key, user, guild):
     if not guild:
         return False, "❌ Isso só funciona dentro de um servidor."
 
-    pode = (user.id == ping.get("criado_por")) or user.guild_permissions.manage_roles
+    pode = (user.id == ping.get("criado_por")) or _pode_pingar(user, guild)
     if not pode:
-        return False, "❌ Só quem criou o ping (ou tem permissão de Gerenciar Cargos) pode iniciar a sala."
+        return False, "❌ Só quem criou o ping, um caller, um gestor de saldo ou um admin do servidor pode iniciar a sala."
 
     ping.setdefault("participantes_tempo", {})
     if ping.get("canal_voz_id"):
@@ -2346,7 +2402,7 @@ class PingConteudoModal(discord.ui.Modal, title="Criar ping de conteudo"):
     composicao="Composicao (build) de referencia - opcional, pode deixar vazio e so escrever as vagas",
 )
 @app_commands.autocomplete(composicao=templates_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def ping_conteudo(interaction: discord.Interaction, canal: discord.TextChannel, composicao: str = None):
     set_current_guild(interaction.guild_id)
     comp = None
@@ -2559,9 +2615,9 @@ async def _criar_evento_do_ping_core(ping_key, user, guild):
     if not guild:
         return False, "❌ Isso só funciona dentro de um servidor.", None
 
-    pode = (user.id == ping.get("criado_por")) or user.guild_permissions.manage_roles
+    pode = (user.id == ping.get("criado_por")) or _pode_pingar(user, guild)
     if not pode:
-        return False, "❌ Só quem criou o ping (ou tem permissão de Gerenciar Cargos) pode criar o evento a partir dele.", None
+        return False, "❌ Só quem criou o ping, um caller, um gestor de saldo ou um admin do servidor pode criar o evento a partir dele.", None
 
     thread = guild.get_channel_or_thread(ping["thread_id"]) if ping.get("thread_id") else None
     canal_destino = thread or guild.get_channel(ping["canal_id"])
@@ -2682,7 +2738,7 @@ async def handle_criar_evento_button(interaction: discord.Interaction, ping_id):
     await interaction.followup.send(msg, ephemeral=True)
 
 
-@bot.tree.command(name="criar-evento", description="[organizador] Cria a sala do evento a partir de um ping aberto, com quem ja confirmou")
+@bot.tree.command(name="criar-evento", description="[caller] Cria a sala do evento a partir de um ping aberto, com quem ja confirmou")
 @app_commands.describe(ping="Qual ping (aberto) usar como base do evento")
 @app_commands.autocomplete(ping=pings_abertos_autocomplete)
 async def criar_evento_cmd(interaction: discord.Interaction, ping: str):
@@ -3153,9 +3209,9 @@ async def saldo_membro(interaction: discord.Interaction):
 @saldo_group.command(name="todos", description="[gestor de saldo] Mostra o saldo total e o saldo de cada membro da guilda")
 async def saldo_todos(interaction: discord.Interaction):
     set_current_guild(interaction.guild_id)
-    if not is_saldo_gestor(interaction.guild_id, interaction.user.id):
+    if not _pode_saldo(interaction.user, interaction.guild):
         await interaction.response.send_message(
-            "❌ Você não é gestor de saldo dessa guilda. Só o contratante do bot (ou quem ele autorizou) pode ver o saldo geral da guilda.",
+            MSG_SEM_SALDO,
             ephemeral=True,
         )
         return
@@ -3185,9 +3241,9 @@ async def saldo_todos(interaction: discord.Interaction):
 @app_commands.describe(membro="De quem ver o saldo")
 async def saldo_consultar(interaction: discord.Interaction, membro: discord.Member):
     set_current_guild(interaction.guild_id)
-    if not is_saldo_gestor(interaction.guild_id, interaction.user.id):
+    if not _pode_saldo(interaction.user, interaction.guild):
         await interaction.response.send_message(
-            "❌ Você não é gestor de saldo dessa guilda. Só o contratante do bot (ou quem ele autorizou) pode consultar saldo de outras pessoas.",
+            MSG_SEM_SALDO,
             ephemeral=True,
         )
         return
@@ -3203,9 +3259,9 @@ async def saldo_consultar(interaction: discord.Interaction, membro: discord.Memb
 @app_commands.describe(membro="Quem foi pago", valor="Valor pago em prata (deixe vazio pra zerar o saldo inteiro)")
 async def saldo_quitar(interaction: discord.Interaction, membro: discord.Member, valor: str = None):
     set_current_guild(interaction.guild_id)
-    if not is_saldo_gestor(interaction.guild_id, interaction.user.id):
+    if not _pode_saldo(interaction.user, interaction.guild):
         await interaction.response.send_message(
-            "❌ Você não é gestor de saldo dessa guilda. Só o contratante do bot (ou quem ele autorizou) pode dar baixa em saldo.",
+            MSG_SEM_SALDO,
             ephemeral=True,
         )
         return
@@ -3224,7 +3280,7 @@ async def saldo_quitar(interaction: discord.Interaction, membro: discord.Member,
     )
 
 
-@bot.tree.command(name="saldo-gestor", description="[contratante] Adiciona ou remove alguém como gestor de saldo dessa guilda")
+@bot.tree.command(name="saldo-gestor", description="[admin] Adiciona ou remove alguém como gestor de saldo dessa guilda")
 @app_commands.describe(acao="adicionar ou remover", membro="Quem vai virar/deixar de ser gestor de saldo")
 @app_commands.choices(acao=[
     app_commands.Choice(name="adicionar", value="adicionar"),
@@ -3232,11 +3288,9 @@ async def saldo_quitar(interaction: discord.Interaction, membro: discord.Member,
 ])
 async def saldo_gestor(interaction: discord.Interaction, acao: app_commands.Choice[str], membro: discord.Member):
     set_current_guild(interaction.guild_id)
-    dono = owner_discord_id_for_guild(interaction.guild_id)
-    if dono is None or str(interaction.user.id) != str(dono):
+    if not _eh_admin(interaction.user, interaction.guild):
         await interaction.response.send_message(
-            "❌ Só quem contratou o slot de guilda do bot pode gerenciar quem tem acesso ao saldo. "
-            "Isso também pode ser feito pelo dashboard, na página de configuração.",
+            "❌ Só admin do servidor decide quem é gestor de saldo. Também dá pra fazer isso pelo site, no painel do servidor.",
             ephemeral=True,
         )
         return
@@ -3253,6 +3307,154 @@ async def saldo_gestor(interaction: discord.Interaction, acao: app_commands.Choi
             save_saldo_gestores(gestores, interaction.guild_id)
         await interaction.response.send_message(f"✅ **{membro.display_name}** não é mais gestor de saldo.", ephemeral=True)
 
+
+
+@saldo_group.command(name="ajustar", description="[gestor de saldo] Adiciona ou remove prata do saldo de um membro")
+@app_commands.describe(
+    membro="De quem é o saldo",
+    valor="Quanto. Positivo adiciona, negativo remove (ex: 500000 ou -200000)",
+    motivo="Por que (aparece no histórico)",
+)
+async def saldo_ajustar(interaction: discord.Interaction, membro: discord.Member, valor: str, motivo: str = None):
+    set_current_guild(interaction.guild_id)
+    if not _pode_saldo(interaction.user, interaction.guild):
+        await interaction.response.send_message(MSG_SEM_SALDO, ephemeral=True)
+        return
+    try:
+        bruto = str(valor).strip().replace(" ", "")
+        sinal = -1 if bruto.startswith("-") else 1
+        num = float(bruto.lstrip("+-").replace(".", "").replace(",", ".")) * sinal
+    except ValueError:
+        await interaction.response.send_message("Valor inválido. Use só números, com `-` na frente pra remover.", ephemeral=True)
+        return
+    if num == 0:
+        await interaction.response.send_message("O valor precisa ser diferente de zero.", ephemeral=True)
+        return
+    novo = ajustar_saldo(
+        interaction.guild_id, membro.id, membro.display_name, num, motivo or "Ajuste manual",
+        interaction.user.id, por_nome=interaction.user.display_name,
+    )
+    acao = "Adicionado" if num > 0 else "Removido"
+    await interaction.response.send_message(
+        f"✅ {acao} **{_fmt_prata(abs(num))} prata** de **{membro.display_name}**. Saldo agora: **{_fmt_prata(novo)} prata**.",
+        ephemeral=True,
+    )
+
+
+NIVEL_CHOICES = [
+    app_commands.Choice(name="caller (pode pingar)", value="caller"),
+    app_commands.Choice(name="gestor de saldo (saldo e pingar)", value="gestor"),
+]
+NOME_NIVEL = {"caller": "caller", "gestor": "gestor de saldo"}
+
+
+async def _so_admin(interaction):
+    set_current_guild(interaction.guild_id)
+    if _eh_admin(interaction.user, interaction.guild):
+        return True
+    await interaction.response.send_message(
+        "❌ Só admin do servidor (Administrador ou Gerenciar Servidor) mexe nas permissões da equipe.", ephemeral=True,
+    )
+    return False
+
+
+@permissao_group.command(name="adicionar", description="[admin] Libera uma pessoa como caller ou gestor de saldo")
+@app_commands.describe(nivel="O que ela vai poder fazer", membro="Quem")
+@app_commands.choices(nivel=NIVEL_CHOICES)
+async def permissao_adicionar(interaction: discord.Interaction, nivel: app_commands.Choice[str], membro: discord.Member):
+    if not await _so_admin(interaction):
+        return
+    set_permissao(interaction.guild_id, nivel.value, "pessoas", membro.id, adicionar=True)
+    await interaction.response.send_message(f"✅ **{membro.display_name}** agora é **{NOME_NIVEL[nivel.value]}**.", ephemeral=True)
+
+
+@permissao_group.command(name="remover", description="[admin] Tira uma pessoa de caller ou de gestor de saldo")
+@app_commands.describe(nivel="De qual nível tirar", membro="Quem")
+@app_commands.choices(nivel=NIVEL_CHOICES)
+async def permissao_remover(interaction: discord.Interaction, nivel: app_commands.Choice[str], membro: discord.Member):
+    if not await _so_admin(interaction):
+        return
+    mudou = set_permissao(interaction.guild_id, nivel.value, "pessoas", membro.id, adicionar=False)
+    txt = f"✅ **{membro.display_name}** não é mais **{NOME_NIVEL[nivel.value]}**." if mudou else f"**{membro.display_name}** já não era {NOME_NIVEL[nivel.value]}."
+    await interaction.response.send_message(txt, ephemeral=True)
+
+
+@permissao_group.command(name="cargo", description="[admin] Faz todo mundo de um cargo virar caller ou gestor de saldo (ou desfaz)")
+@app_commands.describe(nivel="O que o cargo libera", cargo="Qual cargo do Discord", acao="Ligar ou desligar")
+@app_commands.choices(nivel=NIVEL_CHOICES, acao=[
+    app_commands.Choice(name="ligar", value="ligar"),
+    app_commands.Choice(name="desligar", value="desligar"),
+])
+async def permissao_cargo(interaction: discord.Interaction, nivel: app_commands.Choice[str], cargo: discord.Role, acao: app_commands.Choice[str]):
+    if not await _so_admin(interaction):
+        return
+    ligar = acao.value == "ligar"
+    set_permissao(interaction.guild_id, nivel.value, "cargos", cargo.id, adicionar=ligar)
+    if ligar:
+        txt = f"✅ Quem tem o cargo {cargo.mention} agora é **{NOME_NIVEL[nivel.value]}**."
+    else:
+        txt = f"✅ O cargo {cargo.mention} não libera mais **{NOME_NIVEL[nivel.value]}**."
+    await interaction.response.send_message(txt, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@permissao_group.command(name="criar-cargos", description="[admin] Cria os cargos Caller e Gestor de Saldo já ligados às permissões")
+async def permissao_criar_cargos(interaction: discord.Interaction):
+    if not await _so_admin(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    linhas = []
+    for nivel, nome, cor in (("caller", "Caller", 0xE2BC62), ("gestor", "Gestor de Saldo", 0x6FCF8E)):
+        cargo = discord.utils.get(interaction.guild.roles, name=nome)
+        if cargo is None:
+            try:
+                cargo = await interaction.guild.create_role(name=nome, colour=discord.Colour(cor), mentionable=True,
+                                                            reason=f"/permissao criar-cargos por {interaction.user}")
+                linhas.append(f"Criei o cargo {cargo.mention}.")
+            except discord.Forbidden:
+                linhas.append(f"❌ Não consegui criar **{nome}**: o bot precisa da permissão Gerenciar Cargos.")
+                continue
+        else:
+            linhas.append(f"O cargo {cargo.mention} já existia, usei ele.")
+        set_permissao(interaction.guild_id, nivel, "cargos", cargo.id, adicionar=True)
+    linhas.append("\nAgora é só dar esses cargos pra equipe. Caller pinga; Gestor de Saldo pinga e mexe no saldo; "
+                  "admin do servidor faz tudo.")
+    await interaction.followup.send("\n".join(linhas), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@permissao_group.command(name="listar", description="Mostra quem é caller e quem é gestor de saldo")
+async def permissao_listar(interaction: discord.Interaction):
+    set_current_guild(interaction.guild_id)
+    perms = load_permissoes(interaction.guild_id)
+    embed = discord.Embed(title="Equipe do bot", color=0xE2BC62,
+                          description="**Admin do servidor** (Administrador ou Gerenciar Servidor) faz tudo.")
+    for nivel, titulo, oque in (("gestor", "Gestores de saldo", "mexem no saldo e pingam"), ("caller", "Callers", "pingam, criam eventos e montam composições")):
+        cargos = [f"<@&{c}>" for c in perms[nivel]["cargos"]]
+        pessoas = [f"<@{p}>" for p in perms[nivel]["pessoas"]]
+        valor = (f"Cargos: {', '.join(cargos)}\n" if cargos else "") + (f"Pessoas: {', '.join(pessoas)}" if pessoas else "")
+        embed.add_field(name=f"{titulo} ({oque})", value=(valor or "Ninguém ainda.")[:1024], inline=False)
+    meu = _nivel(interaction.user, interaction.guild)
+    embed.set_footer(text=f"Seu nível: {({'admin': 'admin', 'gestor': 'gestor de saldo', 'caller': 'caller'}).get(meu, 'membro')}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, SemPermissao):
+        msg = str(error)
+    elif isinstance(error, app_commands.MissingPermissions):
+        msg = "❌ Você não tem permissão pra usar esse comando."
+    elif isinstance(error, app_commands.CheckFailure):
+        msg = "❌ Você não tem permissão pra usar esse comando."
+    else:
+        print(f"[erro] comando /{interaction.command.qualified_name if interaction.command else '?'}: {error!r}")
+        msg = "❌ Deu um erro ao rodar esse comando. Tenta de novo em instantes."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 async def _encerrar_ping_core(interaction: discord.Interaction, ping_key):
     """Trava as vagas de um ping, posta o roster final e pergunta se vai ter
@@ -3344,7 +3546,7 @@ async def _encerrar_ping_core(interaction: discord.Interaction, ping_key):
 @bot.tree.command(name="encerrar-ping", description="Encerra um ping de conteudo (trava as vagas) e, se quiser, abre a divisao de loot")
 @app_commands.describe(ping="Qual ping encerrar (deixe vazio se estiver rodando dentro do tópico do ping)")
 @app_commands.autocomplete(ping=pings_abertos_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def encerrar_ping(interaction: discord.Interaction, ping: str = None):
     set_current_guild(interaction.guild_id)
     pings = load_pings()
@@ -3358,7 +3560,7 @@ async def encerrar_ping(interaction: discord.Interaction, ping: str = None):
 @evento_group.command(name="iniciar", description="Inicia um novo evento agora: cria a call e o painel de classes/composicao")
 @app_commands.describe(nome="Nome do evento (ex: ZvZ Terca, Avalon Roads)", template="Composicao a usar (vazio = roster padrao de /classes)")
 @app_commands.autocomplete(template=templates_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def evento_iniciar(interaction: discord.Interaction, nome: str, template: str = None):
     set_current_guild(interaction.guild_id)
     await interaction.response.defer(ephemeral=True)
@@ -3413,7 +3615,7 @@ async def evento_iniciar(interaction: discord.Interaction, nome: str, template: 
     template="Composicao a usar (vazio = roster padrao de /classes)",
 )
 @app_commands.autocomplete(template=templates_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def evento_agendar(interaction: discord.Interaction, nome: str, data: str, hora: str, template: str = None):
     set_current_guild(interaction.guild_id)
     await interaction.response.defer(ephemeral=True)
@@ -3481,7 +3683,7 @@ async def evento_agenda(interaction: discord.Interaction):
 @evento_group.command(name="finalizar", description="Encerra o evento, calcula o tempo de cada um e inicia a divisao do loot")
 @app_commands.describe(evento="Qual evento encerrar")
 @app_commands.autocomplete(evento=eventos_abertos_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def evento_finalizar(interaction: discord.Interaction, evento: str):
     set_current_guild(interaction.guild_id)
     events = load_events()
@@ -3544,7 +3746,7 @@ async def evento_finalizar(interaction: discord.Interaction, evento: str):
 
 @evento_group.command(name="cancelar", description="Cancela um evento sem dividir loot (ex: criado por engano)")
 @app_commands.autocomplete(evento=eventos_abertos_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
+@requer_pingar()
 async def evento_cancelar(interaction: discord.Interaction, evento: str):
     set_current_guild(interaction.guild_id)
     events = load_events()
@@ -3606,11 +3808,9 @@ async def _iniciar_evento_core(event_id, user, guild):
     if not event or event.get("status") != "aberto":
         return False, "❌ Evento não encontrado ou a call ainda não foi criada."
 
-    pode_iniciar = (user.id == event.get("criado_por")) or (
-        guild and user.guild_permissions.manage_roles
-    )
+    pode_iniciar = (user.id == event.get("criado_por")) or _pode_pingar(user, guild)
     if not pode_iniciar:
-        return False, "❌ Só quem criou o evento (ou tem permissão de Gerenciar Cargos) pode iniciar a contagem."
+        return False, "❌ Só quem criou o evento, um caller, um gestor de saldo ou um admin do servidor pode iniciar a contagem."
 
     if event.get("contagem_iniciada"):
         return False, "⚠️ A contagem desse evento já foi iniciada."
@@ -3641,7 +3841,7 @@ async def handle_iniciar_evento_button(interaction: discord.Interaction, event_i
     await interaction.response.send_message(msg, ephemeral=not ok)
 
 
-@bot.tree.command(name="iniciar-evento", description="[organizador] Inicia a contagem de tempo do evento pra quem ja esta na call, todos juntos")
+@bot.tree.command(name="iniciar-evento", description="[caller] Inicia a contagem de tempo do evento pra quem ja esta na call, todos juntos")
 @app_commands.describe(evento="Qual evento comecar a contagem")
 @app_commands.autocomplete(evento=eventos_abertos_autocomplete)
 async def iniciar_evento(interaction: discord.Interaction, evento: str):
@@ -3692,7 +3892,8 @@ SECOES_COMANDOS = [
     ("Pings de conteúdo", ["ping-conteudo", "encerrar-ping", "ping-funcao"]),
     ("Composições", ["comp"]),
     ("Classes (roster simples)", ["classes"]),
-    ("Saldo e loot", ["saldo", "saldo-consultar", "saldo-quitar", "saldo-gestor"]),
+    ("Saldo e loot", ["saldo", "saldo-consultar", "saldo-quitar"]),
+    ("Equipe e permissões", ["permissao", "saldo-gestor"]),
     ("Jogadores", ["perfil"]),
     ("Ajuda e admin", ["comandos", "sync"]),
 ]
@@ -3722,7 +3923,7 @@ async def comandos_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Comandos do bot",
         description=(
-            "Os marcados com **[organizador]**, **[gestor de saldo]**, **[contratante]** ou **[admin]** "
+            "Os marcados com **[caller]**, **[gestor de saldo]** ou **[admin]** "
             "só funcionam pra quem tem essa função. Dá pra fazer quase tudo também pelo site, "
             f"no painel do servidor: {FRONTEND_URL_PUBLICO}"
         ),
@@ -3793,6 +3994,7 @@ bot.tree.add_command(classes_group)
 bot.tree.add_command(evento_group)
 bot.tree.add_command(comp_group)
 bot.tree.add_command(saldo_group)
+bot.tree.add_command(permissao_group)
 
 
 @bot.tree.error
@@ -4046,6 +4248,71 @@ async def _internal_channels(request):
         if c.permissions_for(guild.me).send_messages
     ]
     return _iweb.json_response({"channels": canais})
+
+
+def _guild_da_query(request):
+    try:
+        return bot.get_guild(int(request.query.get("guild_id", "0")))
+    except ValueError:
+        return None
+
+
+async def _internal_nivel(request):
+    """Nivel de permissao de uma pessoa num servidor (admin/gestor/caller/None),
+    calculado com os cargos reais dela. O site usa isso pra liberar telas."""
+    _internal_check(request)
+    guild = _guild_da_query(request)
+    if not guild:
+        return _iweb.json_response({"nivel": None, "no_servidor": False})
+    try:
+        uid = int(request.query.get("user_id", "0"))
+    except ValueError:
+        return _iweb.json_response({"error": "user_id invalido"}, status=400)
+    membro = guild.get_member(uid)
+    if membro is None:
+        try:
+            membro = await guild.fetch_member(uid)
+        except discord.HTTPException:
+            return _iweb.json_response({"nivel": None, "no_servidor": False})
+    set_current_guild(guild.id)
+    nivel = _nivel(membro, guild)
+    if nivel is None and membro.guild_permissions.manage_roles:
+        nivel = "caller"
+    return _iweb.json_response({"nivel": nivel, "no_servidor": True, "nome": membro.display_name})
+
+
+async def _internal_membros(request):
+    _internal_check(request)
+    guild = _guild_da_query(request)
+    if not guild:
+        return _iweb.json_response({"error": "guilda nao encontrada"}, status=404)
+    q = (request.query.get("q") or "").strip().lower()
+    ids = [x for x in (request.query.get("ids") or "").split(",") if x.strip().isdigit()]
+    if ids:
+        achados = [guild.get_member(int(i)) for i in ids]
+    else:
+        achados = [m for m in guild.members if not m.bot and (
+            not q or q in m.display_name.lower() or q in m.name.lower())]
+        achados.sort(key=lambda m: m.display_name.lower())
+        achados = achados[:25]
+    return _iweb.json_response({"membros": [
+        {"id": str(m.id), "nome": m.display_name, "usuario": m.name,
+         "avatar": str(m.display_avatar.url) if m.display_avatar else None}
+        for m in achados if m is not None
+    ]})
+
+
+async def _internal_cargos(request):
+    _internal_check(request)
+    guild = _guild_da_query(request)
+    if not guild:
+        return _iweb.json_response({"error": "guilda nao encontrada"}, status=404)
+    cargos = [
+        {"id": str(r.id), "nome": r.name, "cor": f"#{r.colour.value:06x}" if r.colour.value else None}
+        for r in sorted(guild.roles, key=lambda r: -r.position)
+        if not r.is_default() and not r.managed
+    ]
+    return _iweb.json_response({"cargos": cargos})
 
 
 async def _internal_create_ping(request):
@@ -4364,6 +4631,9 @@ async def _start_internal_api():
     app = _iweb.Application()
     app.add_routes([
         _iweb.get("/channels", _internal_channels),
+        _iweb.get("/nivel", _internal_nivel),
+        _iweb.get("/membros", _internal_membros),
+        _iweb.get("/cargos", _internal_cargos),
         _iweb.post("/pings", _internal_create_ping),
         _iweb.put("/pings/{ping_id}", _internal_edit_ping),
         _iweb.post("/pings/{ping_id}/encerrar", _internal_encerrar_ping),

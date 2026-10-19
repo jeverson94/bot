@@ -1942,6 +1942,7 @@ def _usable_workspaces(session):
             "icon": info.get("icon"),
             "personal": False,
             "slot_id": None,
+            "nivel": info.get("nivel") or "admin",
         })
     return usable
 
@@ -2549,9 +2550,17 @@ def discord_callback():
         except (TypeError, ValueError):
             perms = 0
         is_admin = bool(perms & PERM_ADMINISTRATOR) or bool(perms & PERM_MANAGE_GUILD)
-        if is_admin and g.get("id") in tenant_ids:
+        if g.get("id") not in tenant_ids:
+            continue
+        nivel = "admin" if is_admin else None
+        if not is_admin:
+            # caller/gestor dado por pessoa ou por cargo: quem sabe os cargos e o bot
+            resp, status = _internal_call("GET", "/nivel", guild_id=g["id"], user_id=user.get("id"))
+            if status == 200:
+                nivel = resp.get("nivel")
+        if nivel:
             eligible_guild_ids.append(g["id"])
-            eligible_guilds.append({"id": g["id"], "name": g.get("name"), "icon": g.get("icon")})
+            eligible_guilds.append({"id": g["id"], "name": g.get("name"), "icon": g.get("icon"), "nivel": nivel})
 
     session_token = secrets.token_urlsafe(32)
     sessions = _load_sessions()
@@ -2768,22 +2777,36 @@ def api_saldo_me():
     data = shared.load_saldos(guild_id)
     entrada = data.get("saldos", {}).get(discord_id)
     valor = entrada.get("valor", 0.0) if entrada else 0.0
-    eh_gestor = shared.is_saldo_gestor(guild_id, discord_id)
-    return jsonify({"ok": True, "valor": valor, "gestor": eh_gestor})
+    nivel = _nivel_site(session, guild_id)
+    return jsonify({"ok": True, "valor": valor, "gestor": nivel in ("admin", "gestor"), "nivel": nivel})
+
+
+def _nivel_site(session, guild_id):
+    """admin / gestor / caller / None dessa pessoa nesse servidor. Pergunta pro
+    bot (ele sabe os cargos reais); se o bot estiver fora, usa o que ficou
+    guardado no login."""
+    if str(guild_id).startswith("user_"):
+        return "admin"
+    resp, status = _internal_call("GET", "/nivel", guild_id=guild_id, user_id=session["discord_id"])
+    if status == 200:
+        return resp.get("nivel")
+    for g in session.get("eligible_guilds", []):
+        if str(g.get("id")) == str(guild_id):
+            return g.get("nivel") or "admin"
+    if shared.is_saldo_gestor(guild_id, session["discord_id"]):
+        return "gestor"
+    return None
 
 
 def _require_saldo_gestor(session, guild_id):
-    """Aborta 403 se o usuario da sessao nao for gestor de saldo dessa
-    guilda (dono do slot ou gestor extra cadastrado)."""
-    if not shared.is_saldo_gestor(guild_id, session["discord_id"]):
+    """403 se a pessoa nao for gestor de saldo nem admin desse servidor."""
+    if _nivel_site(session, guild_id) not in ("admin", "gestor"):
         abort(403)
 
 
 def _require_slot_owner(session, guild_id):
-    """Aborta 403 se o usuario da sessao nao for o CONTRATANTE (dono do
-    slot de guilda) - so ele pode adicionar/remover gestores de saldo."""
-    dono = shared.owner_discord_id_for_guild(guild_id)
-    if dono is None or str(session["discord_id"]) != str(dono):
+    """403 se a pessoa nao for admin do servidor (quem decide a equipe)."""
+    if _nivel_site(session, guild_id) != "admin":
         abort(403)
 
 
@@ -2875,6 +2898,91 @@ def api_saldo_gestores_remove(discord_id):
         gestores.remove(discord_id)
         shared.save_saldo_gestores(gestores, guild_id)
     return jsonify({"ok": True})
+
+
+@app.route("/api/saldo/ajustar", methods=["POST"])
+def api_saldo_ajustar():
+    """Adiciona (valor > 0) ou remove (valor < 0) prata do saldo de alguem.
+    Gestor de saldo ou admin."""
+    session, guild_id = require_guild_session()
+    _require_saldo_gestor(session, guild_id)
+    body = request.get_json(silent=True) or {}
+    discord_id = str(body.get("discord_id") or "").strip()
+    if not discord_id.isdigit():
+        abort(400)
+    try:
+        valor = float(body.get("valor"))
+    except (TypeError, ValueError):
+        abort(400)
+    if valor == 0:
+        abort(400)
+    novo = shared.ajustar_saldo(
+        guild_id, discord_id, (body.get("nome") or "").strip()[:80] or None, valor,
+        (body.get("motivo") or "").strip()[:120] or "Ajuste pelo site",
+        session["discord_id"], por_nome=session.get("global_name") or session.get("username"),
+    )
+    return jsonify({"ok": True, "novo_saldo": novo})
+
+
+@app.route("/api/saldo/historico")
+def api_saldo_historico():
+    session, guild_id = require_guild_session()
+    _require_saldo_gestor(session, guild_id)
+    hist = shared.load_saldos(guild_id).get("historico", [])[-100:]
+    return jsonify({"ok": True, "historico": list(reversed(hist))})
+
+
+@app.route("/api/equipe")
+def api_equipe():
+    """Quem e caller e quem e gestor de saldo (pessoas e cargos), com nomes, e
+    o nivel de quem esta vendo. Qualquer um da equipe pode ver; so admin muda."""
+    session, guild_id = require_guild_session()
+    nivel = _nivel_site(session, guild_id)
+    if nivel is None:
+        abort(403)
+    perms = shared.load_permissoes(guild_id)
+    ids = sorted({p for n in perms.values() for p in n["pessoas"]})
+    nomes, cargos = {}, []
+    if ids:
+        resp, status = _internal_call("GET", "/membros", guild_id=guild_id, ids=",".join(ids))
+        if status == 200:
+            nomes = {m["id"]: m for m in resp.get("membros", [])}
+    resp, status = _internal_call("GET", "/cargos", guild_id=guild_id)
+    if status == 200:
+        cargos = resp.get("cargos", [])
+    cargo_por_id = {c["id"]: c for c in cargos}
+    out = {}
+    for n, bloco in perms.items():
+        out[n] = {
+            "pessoas": [{"id": p, "nome": (nomes.get(p) or {}).get("nome") or p, "avatar": (nomes.get(p) or {}).get("avatar")} for p in bloco["pessoas"]],
+            "cargos": [cargo_por_id.get(c) or {"id": c, "nome": "cargo apagado", "cor": None} for c in bloco["cargos"]],
+        }
+    return jsonify({"ok": True, "meu_nivel": nivel, "equipe": out, "cargos_do_servidor": cargos})
+
+
+@app.route("/api/equipe", methods=["POST"])
+def api_equipe_alterar():
+    """{nivel: caller|gestor, tipo: pessoas|cargos, id, acao: adicionar|remover}. So admin."""
+    session, guild_id = require_guild_session()
+    _require_slot_owner(session, guild_id)
+    body = request.get_json(silent=True) or {}
+    nivel, tipo = body.get("nivel"), body.get("tipo")
+    alvo = str(body.get("id") or "").strip()
+    if nivel not in shared.NIVEIS_PERMISSAO or tipo not in ("pessoas", "cargos") or not alvo.isdigit():
+        abort(400)
+    shared.set_permissao(guild_id, nivel, tipo, alvo, adicionar=body.get("acao") != "remover")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/membros")
+def api_membros():
+    """Busca membros do servidor pelo nome (pra escolher quem liberar ou
+    ajustar saldo). So pra quem e da equipe."""
+    session, guild_id = require_guild_session()
+    if _nivel_site(session, guild_id) is None:
+        abort(403)
+    resp, status = _internal_call("GET", "/membros", guild_id=guild_id, q=(request.args.get("q") or "")[:40])
+    return jsonify(resp), status
 
 
 @app.route("/webhooks/stripe", methods=["POST"])
