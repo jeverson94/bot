@@ -1930,6 +1930,19 @@ def _usable_workspaces(session):
                 "personal": True,
                 "slot_id": slot.get("id"),
             })
+    # Sem assinatura: toda guilda que essa pessoa administra no Discord e que
+    # ja tem o bot instalado entra direto, mesmo sem slot comprado.
+    ja = {w["id"] for w in usable}
+    for gid, info in eligible_by_id.items():
+        if gid in ja:
+            continue
+        usable.append({
+            "id": gid,
+            "name": info.get("name") or f"Guilda {gid}",
+            "icon": info.get("icon"),
+            "personal": False,
+            "slot_id": None,
+        })
     return usable
 
 
